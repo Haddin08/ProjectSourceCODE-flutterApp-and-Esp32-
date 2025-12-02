@@ -63,6 +63,9 @@ class _HomeScreenState extends State<HomeScreen> {
   final List<String> _logs = [];
   final Notifications notifications = Notifications();
 
+  // NEW FIELD (requested)
+  String _rxBuffer = '';
+
   @override
   void initState() {
     super.initState();
@@ -97,7 +100,9 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _status = "Device not found");
   }
 
-  // CONNECT TO ESP32 — replaced with 2nd code logic
+  // ---------------------------------------------------------------------
+  // FULLY UPDATED CONNECT FUNCTION (requested)
+  // ---------------------------------------------------------------------
   Future<void> _connectTo(String address) async {
     setState(() => _status = "Connecting...");
 
@@ -112,45 +117,71 @@ class _HomeScreenState extends State<HomeScreen> {
     _connected = true;
     setState(() => _status = "Connected");
 
-    // LISTEN FOR DATA — replaced with 2nd code logic
+    // Robust line-buffer input listener
     _inputSub = conn.input?.listen((Uint8List data) {
-      final text = utf8.decode(data, allowMalformed: true).trim();
-      if (text.isEmpty) return;
+      final chunk = utf8.decode(data, allowMalformed: true);
+      _rxBuffer += chunk;
 
-      setState(() => _logs.insert(0, "RX: $text"));
+      final lines = _rxBuffer.split(RegExp(r'[\r\n]+'));
 
-      // GPS
-      if (text.startsWith("GPS,")) {
-        final p = text.split(',');
-        if (p.length >= 3) {
-          _lat = double.tryParse(p[1]);
-          _lng = double.tryParse(p[2]);
-          setState(() {});
+      if (!_rxBuffer.endsWith('\n') && !_rxBuffer.endsWith('\r')) {
+        _rxBuffer = lines.removeLast();
+      } else {
+        _rxBuffer = '';
+      }
+
+      for (final rawLine in lines) {
+        final text = rawLine.trim();
+        if (text.isEmpty) continue;
+
+        setState(() => _logs.insert(0, "RX: $text"));
+
+        // GPS
+        if (text.startsWith("GPS,")) {
+          final p = text.split(',');
+          if (p.length >= 3) {
+            _lat = double.tryParse(p[1]);
+            _lng = double.tryParse(p[2]);
+            setState(() {});
+          }
+        }
+
+        // HALL
+        if (text.startsWith("HALL,")) {
+          final p = text.split(',');
+          if (p.length >= 6) {
+            speed = double.tryParse(p[1]) ?? 0.0;
+            distance = double.tryParse(p[3]) ?? 0.0;
+            calories = double.tryParse(p[5]) ?? 0.0;
+            setState(() {});
+          }
+        }
+
+        // ACK
+        if (text.startsWith("ACK,")) {
+          setState(() => _logs.insert(0, "ACK: ${text.substring(4)}"));
+        }
+
+        // ALERT
+        if (text.startsWith("ALERT,")) {
+          if (text.contains("MOTION_DETECTED")) {
+            notifications.showNotification(
+              "Motion Detected!",
+              "Your bike is being moved!",
+            );
+          }
         }
       }
-
-      // SPEED / DISTANCE / CALORIES
-      if (text.startsWith("HALL,")) {
-        final p = text.split(',');
-        if (p.length >= 6) {
-          speed = double.tryParse(p[1]) ?? 0.0;
-          distance = double.tryParse(p[3]) ?? 0.0;
-          calories = double.tryParse(p[5]) ?? 0.0;
-          setState(() {});
-        }
-      }
-
-      // MOTION DETECTED
-      if (text.contains("MOTION_DETECTED")) {
-        notifications.showNotification(
-          "Motion Detected!",
-          "Your bike is being moved!",
-        );
-      }
+    }, onDone: () {
+      _connected = false;
+      setState(() => _status = "Disconnected");
+    }, onError: (e) {
+      _connected = false;
+      setState(() => _status = "Error: $e");
     });
   }
 
-  // SEND COMMAND
+  // SEND COMMAND (unchanged)
   void _sendCommand(String cmd) {
     if (_connected && _connection != null) {
       _connection!.writeString("$cmd\n");
@@ -164,11 +195,7 @@ class _HomeScreenState extends State<HomeScreen> {
       point: latLng.LatLng(_lat!, _lng!),
       width: 40,
       height: 40,
-      child: const Icon(
-        Icons.location_pin,
-        size: 40,
-        color: Colors.red,
-      ),
+      child: const Icon(Icons.location_pin, size: 40, color: Colors.red),
     )
         : null;
 
@@ -190,9 +217,7 @@ class _HomeScreenState extends State<HomeScreen> {
             Card(
               child: ListTile(
                 leading: Icon(
-                  _connected
-                      ? Icons.bluetooth_connected
-                      : Icons.bluetooth_disabled,
+                  _connected ? Icons.bluetooth_connected : Icons.bluetooth_disabled,
                   color: _connected ? Colors.green : Colors.red,
                 ),
                 title: Text(_status),
@@ -200,7 +225,6 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 12),
 
-            // MAP
             if (_lat != null && _lng != null)
               SizedBox(
                 height: 250,
@@ -211,8 +235,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   children: [
                     TileLayer(
-                      urlTemplate:
-                      "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                      urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
                       userAgentPackageName: "com.bike.app",
                     ),
                     if (marker != null) MarkerLayer(markers: [marker]),
@@ -224,7 +247,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
             const SizedBox(height: 20),
 
-            // DASHBOARD BUTTON
             ElevatedButton.icon(
               icon: const Icon(Icons.speed),
               label: const Text("Open Dashboard"),
@@ -253,10 +275,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
 
             const Divider(),
-            const Text(
-              "Logs",
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
+            const Text("Logs", style: TextStyle(fontWeight: FontWeight.bold)),
 
             Expanded(
               child: ListView.builder(
@@ -272,3 +291,4 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 }
+
