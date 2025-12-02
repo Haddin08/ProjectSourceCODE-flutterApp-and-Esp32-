@@ -15,12 +15,15 @@ const char* btDeviceName = "ESP32_Motion_Alert";
 const int BUZZER_PIN = 13;
 
 // Hall sensor
-const int HALL_PIN = 4; 
+const int HALL_PIN = 4;
 volatile unsigned long hallLastTimeMicros = 0;
-volatile unsigned long hallIntervalMicros = 0;
 volatile unsigned long hallRevolutions = 0;
 
-const float WHEEL_CIRCUMFERENCE_M = 2.1;
+// Debounce min pulse width (ignore pulses that occur faster than this)
+const unsigned long MIN_PULSE_US = 20000UL; // 20 ms -> max 3000 pulses/sec (very safe)
+
+// Wheel and user values
+float WHEEL_CIRCUMFERENCE_M = 2.1; // default circumference in meters (can be updated with SETWHEEL)
 float USER_WEIGHT_KG = 70.0;
 const unsigned long HALL_REPORT_INTERVAL_MS = 1000;
 
@@ -29,7 +32,7 @@ float accumulatedCalories = 0.0;
 
 // Motion detection
 const float MOTION_THRESHOLD_ACCEL = 10.5;
-const int MOTION_PERSIST_COUNT = 3; 
+const int MOTION_PERSIST_COUNT = 3;
 int motionCounter = 0;
 
 // GPS pins
@@ -43,17 +46,20 @@ unsigned long lastGpsSendMillis = 0;
 
 void IRAM_ATTR hallISR() {
     unsigned long now = micros();
-    if (hallLastTimeMicros != 0) {
-        hallIntervalMicros = now - hallLastTimeMicros;
+    // Debounce: ignore pulses that come too fast
+    if (hallLastTimeMicros == 0 || (now - hallLastTimeMicros) >= MIN_PULSE_US) {
+        hallRevolutions++;
+        hallLastTimeMicros = now;
+    } else {
+        // too close — ignore as bounce/noise
     }
-    hallLastTimeMicros = now;
-    hallRevolutions++;
 }
 
 void setup() {
     pinMode(BUZZER_PIN, OUTPUT);
     pinMode(HALL_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallISR, CHANGE);
+    // use RISING so we count one edge per revolution (assuming hall gives single pulse per rev)
+    attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallISR, RISING);
 
     Serial.begin(115200);
     Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
@@ -80,21 +86,20 @@ void setup() {
 
 // ----------------------------------------------------------
 float getCyclingMET(float speed_kmh) {
-    if (speed_kmh < 16.0) {          // Leisure
+    if (speed_kmh < 16.0) {
         return 4.0;
-    } else if (speed_kmh < 19.0) {   // Low-moderate
+    } else if (speed_kmh < 19.0) {
         return 8.0;
-    } else if (speed_kmh < 22.0) {   // Moderate
+    } else if (speed_kmh < 22.0) {
         return 10.0;
-    } else if (speed_kmh < 25.5) {   // High-moderate
+    } else if (speed_kmh < 25.5) {
         return 12.0;
     } else {
-        return 12.0; // Cap MET at 12 for high speeds
+        return 12.0;
     }
 }
 
 // ----------------------------------------------------------
-
 float caloriesForDurationMs(unsigned long dt_ms, float MET, float weight_kg) {
     float hours = dt_ms / 3600000.0;
     return MET * weight_kg * hours;
@@ -110,46 +115,85 @@ void activateBuzzerAlert() {
 }
 
 // ----------------------------------------------------------
+// Compute distance since prevRevs; also returns distance added
+// prevRevs must be static in caller to persist between calls
 float computeAndResetDistanceSince(unsigned long &prevRevs) {
     noInterrupts();
     unsigned long currentRevs = hallRevolutions;
     interrupts();
 
-    unsigned long deltaRevs = (currentRevs >= prevRevs) ? currentRevs - prevRevs : 0;
+    if (prevRevs == 0) {
+        // First time called: initialize to current and return 0 distance to avoid spike
+        prevRevs = currentRevs;
+        return 0.0;
+    }
+
+    unsigned long deltaRevs = (currentRevs >= prevRevs) ? (currentRevs - prevRevs) : 0;
     prevRevs = currentRevs;
 
-    unsigned long trueDeltaRevs = deltaRevs / 2;
-
-    float dist = trueDeltaRevs * WHEEL_CIRCUMFERENCE_M;
+    float dist = (float)deltaRevs * WHEEL_CIRCUMFERENCE_M;
     totalDistance_m += dist;
     return dist;
 }
 
 // ----------------------------------------------------------
+void handleBTCommand(const String &cmdRaw) {
+    String cmd = cmdRaw;
+    cmd.trim();
+    cmd.toUpperCase();
+
+    if (cmd == "LOCK") {
+        motionMonitoringEnabled = true;
+        gpsEnabled = true;
+        SerialBT.println("ACK,LOCKED");
+    } else if (cmd == "UNLOCK") {
+        motionMonitoringEnabled = false;
+        gpsEnabled = false;
+        motionCounter = 0;
+        SerialBT.println("ACK,UNLOCKED");
+    } else if (cmd.startsWith("SETWEIGHT")) {
+        int comma = cmd.indexOf(',');
+        if (comma > 0) {
+            float w = cmd.substring(comma + 1).toFloat();
+            if (w > 20 && w < 300) {
+                USER_WEIGHT_KG = w;
+                SerialBT.println("ACK,SETWEIGHT," + String(USER_WEIGHT_KG, 1));
+            } else {
+                SerialBT.println("ERR,SETWEIGHT");
+            }
+        }
+    } else if (cmd.startsWith("SETWHEEL")) {
+        // expecting SETWHEEL,<diameter_cm>
+        int comma = cmd.indexOf(',');
+        if (comma > 0) {
+            float diameter_cm = cmd.substring(comma + 1).toFloat();
+            if (diameter_cm > 10 && diameter_cm < 400) {
+                // convert diameter(cm) -> circumference meters = PI * (d_cm/100)
+                WHEEL_CIRCUMFERENCE_M = 3.14159265 * (diameter_cm / 100.0);
+                SerialBT.println("ACK,SETWHEEL," + String(WHEEL_CIRCUMFERENCE_M, 3));
+            } else {
+                SerialBT.println("ERR,SETWHEEL");
+            }
+        }
+    } else if (cmd == "RESET_STATS") {
+        totalDistance_m = 0.0;
+        accumulatedCalories = 0.0;
+        // Also reset hall counters
+        noInterrupts();
+        hallRevolutions = 0;
+        interrupts();
+        SerialBT.println("ACK,RESET_STATS");
+    }
+}
+
+// ----------------------------------------------------------
 void loop() {
 
-    // Bluetooth commands
+    // Bluetooth commands (read full lines)
     if (SerialBT.available()) {
         String cmd = SerialBT.readStringUntil('\n');
-        cmd.trim();
-        cmd.toUpperCase();
-
-        if (cmd == "LOCK") {
-            motionMonitoringEnabled = true;
-            gpsEnabled = true;
-            SerialBT.println("LOCKED");
-        } 
-        else if (cmd == "UNLOCK") {
-            motionMonitoringEnabled = false;
-            gpsEnabled = false;
-            motionCounter = 0;
-            SerialBT.println("UNLOCKED");
-        }
-        else if (cmd.startsWith("SETWEIGHT")) {
-            int comma = cmd.indexOf(',');
-            if (comma > 0) {
-                USER_WEIGHT_KG = cmd.substring(comma + 1).toFloat();
-            }
+        if (cmd.length()) {
+            handleBTCommand(cmd);
         }
     }
 
@@ -195,7 +239,10 @@ void loop() {
         float dist_m = computeAndResetDistanceSince(prevRevs);
 
         float dt_s = dt_ms / 1000.0;
-        float speed_m_s = (dt_s > 0) ? dist_m / dt_s : 0;
+        // protect against very small dt_s (shouldn't happen because report interval is 1s)
+        if (dt_s < 0.001) dt_s = 0.001;
+
+        float speed_m_s = (dt_s > 0) ? (dist_m / dt_s) : 0;
         float speed_kmh = speed_m_s * 3.6;
 
         float kcal = 0.0;
